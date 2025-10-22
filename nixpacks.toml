@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+aptPkgs = ["chromium", "chromium-driver"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = [
+  "npx playwright install-deps chromium",
+  "npx playwright install chromium",
+  "npm run build"
+]
+
+[start]
+cmd = "npm start"
