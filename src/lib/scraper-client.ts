@@ -39,10 +39,9 @@ export async function executeScraper(config: ScraperConfig): Promise<Business[]>
     // Build docker command with filters - SPEED OPTIMIZED
     const emailFlag = filters.extractEmails ? '-email' : '';
 
-    // Fast mode: reduces data collection but 3x faster
     // 50 workers: 4x more parallel processing (was 12)
     // 6 CPUs + 8GB RAM: maximum throughput
-    // Combined: ~7-8x speed boost!
+    // Result: ~4-5x speed boost!
     let command = `docker run --rm \\
       -v "${workDir}:/data" \\
       google-maps-scraper \\
@@ -50,7 +49,6 @@ export async function executeScraper(config: ScraperConfig): Promise<Business[]>
       -depth ${filters.depth || 10} \\
       -lang en \\
       -zoom 14 \\
-      -fast-mode \\
       ${emailFlag} \\
       -input /data/${inputFile} \\
       -results /data/${outputFile}`;
