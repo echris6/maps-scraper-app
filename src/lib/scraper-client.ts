@@ -1,5 +1,10 @@
-import { chromium, type Browser, type Page } from "playwright-core";
-import type { Business, SearchFilters } from "./types";
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import type { Business, SearchFilters } from './types';
+
+const execAsync = promisify(exec);
 
 interface ScraperConfig {
   query: string;
@@ -8,224 +13,167 @@ interface ScraperConfig {
 }
 
 /**
- * Execute the Playwright scraper
+ * Execute the Docker scraper
  */
 export async function executeScraper(config: ScraperConfig): Promise<Business[]> {
-  const { query, filters } = config;
+  const { query, filters, outputPath = 'temp' } = config;
 
-  let browser: Browser | null = null;
+  // Get the scraper directory from environment or use default
+  const scraperDir = process.env.DOCKER_SCRAPER_PATH || '/Users/echris/Desktop/Maps Scraper';
+  const workDir = path.join(process.cwd(), outputPath);
+
+  // Ensure output directory exists
+  await fs.mkdir(workDir, { recursive: true });
+
+  // Generate unique filename for this query
+  const timestamp = Date.now();
+  const outputFile = `results_${timestamp}.csv`;
+  const outputFilePath = path.join(workDir, outputFile);
 
   try {
-    console.log(`Starting scrape for: ${query}`);
+    // Build docker command with filters
+    const maxResults = (filters.depth || 10) * 12; // Approximate results per depth level
 
-    // Launch browser
-    browser = await chromium.launch({
-      headless: true,
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+    let command = `docker run --rm \\
+      -v "${workDir}:/data" \\
+      google-maps-scraper \\
+      -c 12 \\
+      -depth ${filters.depth || 10} \\
+      -lang en \\
+      -zoom 14 \\
+      -max ${maxResults} \\
+      -email ${filters.extractEmails ? 'true' : 'false'} \\
+      -q "${query}" \\
+      -results /data/${outputFile}`;
+
+    console.log('Executing Docker scraper...');
+    console.log('Query:', query);
+    console.log('Max results:', maxResults);
+
+    // Execute the scraper
+    const { stdout, stderr } = await execAsync(command, {
+      cwd: scraperDir,
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      timeout: 300000, // 5 minutes timeout
     });
 
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-    });
-
-    const page = await context.newPage();
-
-    // Search Google Maps
-    const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, { waitUntil: 'networkidle', timeout: 60000 });
-
-    // Wait for results to load
-    await page.waitForSelector('[role="feed"]', { timeout: 30000 });
-
-    const businesses: Business[] = [];
-    const maxResults = Math.min((filters.depth || 10) * 12, 500); // Approximate depth to results
-
-    let scrollAttempts = 0;
-    const maxScrollAttempts = filters.depth || 10;
-
-    while (businesses.length < maxResults && scrollAttempts < maxScrollAttempts) {
-      // Get all visible business cards
-      const cards = await page.$$('[role="feed"] > div > div > a');
-
-      console.log(`Found ${cards.length} cards on scroll ${scrollAttempts + 1}`);
-
-      // Extract data from each card
-      for (const card of cards) {
-        try {
-          const href = await card.getAttribute('href');
-          if (!href) continue;
-
-          // Skip if already processed
-          if (businesses.some(b => b.cid === href)) continue;
-
-          // Click to open details
-          await card.click();
-          await page.waitForTimeout(1500); // Wait for sidebar to load
-
-          // Extract business data from sidebar
-          const business = await extractBusinessData(page);
-          if (business) {
-            business.cid = href;
-            businesses.push(business);
-            console.log(`Scraped: ${business.title} (${businesses.length}/${maxResults})`);
-          }
-
-          if (businesses.length >= maxResults) break;
-        } catch (error) {
-          console.error('Error extracting business:', error);
-          continue;
-        }
-      }
-
-      // Scroll to load more results
-      await page.evaluate(() => {
-        const feed = document.querySelector('[role="feed"]');
-        if (feed) {
-          feed.scrollTo(0, feed.scrollHeight);
-        }
-      });
-
-      await page.waitForTimeout(2000);
-      scrollAttempts++;
+    if (stderr) {
+      console.error('Scraper stderr:', stderr);
+    }
+    if (stdout) {
+      console.log('Scraper output:', stdout);
     }
 
-    console.log(`Scraping completed. Found ${businesses.length} businesses.`);
+    // Read and parse CSV results
+    const resultsContent = await fs.readFile(outputFilePath, 'utf-8');
+    const businesses = await parseCSV(resultsContent);
 
+    console.log(`Scraped ${businesses.length} businesses`);
     return businesses;
 
-  } catch (error) {
-    console.error('Scraping error:', error);
-    throw error;
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
+  } catch (error: any) {
+    console.error('Scraper execution error:', error);
+    throw new Error(`Failed to execute scraper: ${error.message}`);
   }
 }
 
 /**
- * Extract business data from Google Maps sidebar
+ * Parse CSV results into Business objects
  */
-async function extractBusinessData(page: Page): Promise<Business | null> {
-  try {
-    // Title
-    const title = await page.$eval('h1', el => el.textContent?.trim() || '').catch(() => '');
+async function parseCSV(csvContent: string): Promise<Business[]> {
+  const lines = csvContent.trim().split('\n');
+  if (lines.length < 2) return [];
 
-    if (!title) return null;
+  const headers = lines[0].split(',').map(h => h.trim());
+  const businesses: Business[] = [];
 
-    // Rating and review count
-    let review_rating = 0;
-    let review_count = 0;
-    try {
-      const ratingText = await page.$eval('[role="img"][aria-label*="star"]', el => el.getAttribute('aria-label') || '');
-      const ratingMatch = ratingText.match(/(\d+\.?\d*)\s*stars?/i);
-      if (ratingMatch) review_rating = parseFloat(ratingMatch[1]);
+  for (let i = 1; i < lines.length; i++) {
+    const values = parseCSVLine(lines[i]);
+    const business: any = {};
 
-      const reviewText = await page.$eval('[role="img"][aria-label*="star"]', el => el.parentElement?.textContent || '');
-      const reviewMatch = reviewText.match(/(\d+,?\d*)\s*reviews?/i);
-      if (reviewMatch) review_count = parseInt(reviewMatch[1].replace(',', ''));
-    } catch {}
+    headers.forEach((header, index) => {
+      business[header] = values[index] || '';
+    });
 
-    // Category
-    let category = '';
-    try {
-      const buttons = await page.$$('button[jsaction]');
-      for (const button of buttons) {
-        const text = await button.textContent();
-        if (text && !text.match(/\d/) && text.length < 50) {
-          category = text.trim();
-          break;
-        }
-      }
-    } catch {}
-
-    // Address
-    let address = '';
-    try {
-      const addressButton = await page.$('[data-item-id="address"]');
-      if (addressButton) {
-        address = await addressButton.evaluate(el => el.textContent?.trim() || '');
-      }
-    } catch {}
-
-    // Phone
-    let phone = '';
-    try {
-      const phoneButton = await page.$('[data-item-id^="phone"]');
-      if (phoneButton) {
-        phone = await phoneButton.evaluate(el => el.textContent?.trim() || '');
-      }
-    } catch {}
-
-    // Website
-    let website = '';
-    try {
-      const websiteLink = await page.$('[data-item-id="authority"]');
-      if (websiteLink) {
-        website = await websiteLink.evaluate(el => el.getAttribute('href') || '');
-      }
-    } catch {}
-
-    // Coordinates (from URL)
-    let latitude = 0;
-    let longitude = 0;
-    try {
-      const url = page.url();
-      const coordMatch = url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
-      if (coordMatch) {
-        latitude = parseFloat(coordMatch[1]);
-        longitude = parseFloat(coordMatch[2]);
-      }
-    } catch {}
-
-    const business: Business = {
-      id: `business_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      title,
-      phone,
-      website,
-      email: '',
-      address,
-      complete_address: address,
-      category,
-      review_rating,
-      review_count,
-      latitude,
-      longitude,
-      cid: '',
-      status: '',
-      open_hours: '',
-      popular_times: '',
-      plus_code: '',
-      reviews_per_rating: '',
-      descriptions: '',
-      reviews_link: '',
-      thumbnail: '',
-      timezone: '',
-      price_range: '',
-      data_id: '',
-      images: '',
-      reservations: '',
-      order_online: '',
-      menu: '',
-      owner: '',
-      about: '',
-      user_reviews: '',
+    // Map CSV fields to Business interface
+    const mappedBusiness: Business = {
+      id: business.id || `business_${Date.now()}_${i}`,
+      title: business.title || business.name || '',
+      phone: business.phone || '',
+      website: business.website || '',
+      email: business.email || '',
+      address: business.address || '',
+      complete_address: business.complete_address || business.address || '',
+      category: business.category || business.type || '',
+      review_rating: parseFloat(business.review_rating || business.rating || '0'),
+      review_count: parseInt(business.review_count || business.reviews_count || '0'),
+      latitude: parseFloat(business.latitude || '0'),
+      longitude: parseFloat(business.longitude || '0'),
+      cid: business.cid || '',
+      status: business.status || '',
+      open_hours: business.open_hours || '',
+      popular_times: business.popular_times || '',
+      plus_code: business.plus_code || '',
+      reviews_per_rating: business.reviews_per_rating || '',
+      descriptions: business.descriptions || '',
+      reviews_link: business.reviews_link || '',
+      thumbnail: business.thumbnail || '',
+      timezone: business.timezone || '',
+      price_range: business.price_range || '',
+      data_id: business.data_id || '',
+      images: business.images || '',
+      reservations: business.reservations || '',
+      order_online: business.order_online || '',
+      menu: business.menu || '',
+      owner: business.owner || '',
+      about: business.about || '',
+      user_reviews: business.user_reviews || '',
     };
 
-    return business;
-  } catch (error) {
-    console.error('Error extracting business data:', error);
-    return null;
+    if (mappedBusiness.title) {
+      businesses.push(mappedBusiness);
+    }
   }
+
+  return businesses;
 }
 
 /**
- * Parse results (now returns directly from executeScraper)
+ * Parse a CSV line handling quoted values
+ */
+function parseCSVLine(line: string): string[] {
+  const values: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      values.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  values.push(current.trim());
+  return values;
+}
+
+/**
+ * Parse results (legacy compatibility)
  */
 export async function parseResults(csvPath: string): Promise<Business[]> {
-  // No longer needed - data is returned directly from executeScraper
-  return [];
+  try {
+    const content = await fs.readFile(csvPath, 'utf-8');
+    return await parseCSV(content);
+  } catch (error) {
+    console.error('Error parsing results:', error);
+    return [];
+  }
 }
 
 /**

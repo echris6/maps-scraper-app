@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
 
     // Start scraping in the background
     const jobId = search.id;
-    const outputPath = `/tmp/results_${jobId}.csv`;
+    const outputPath = "temp";
 
     // Execute scraper asynchronously
     (async () => {
