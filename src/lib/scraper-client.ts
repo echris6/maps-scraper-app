@@ -37,31 +37,23 @@ export async function executeScraper(config: ScraperConfig): Promise<Business[]>
     await fs.writeFile(inputFilePath, query);
 
     // Build docker command with filters - SPEED OPTIMIZED
-    const emailFlag = filters.extractEmails ? '-email' : '';
-
-    // 50 workers: 4x more parallel processing (was 12)
+    // 35 workers: sweet spot for speed vs Google rate limits
     // 6 CPUs + 8GB RAM: maximum throughput
-    // Result: ~4-5x speed boost!
-    let command = `docker run --rm \\
-      -v "${workDir}:/data" \\
-      google-maps-scraper \\
-      -c 50 \\
-      -depth ${filters.depth || 10} \\
-      -lang en \\
-      -zoom 14 \\
-      ${emailFlag} \\
-      -input /data/${inputFile} \\
-      -results /data/${outputFile}`;
+    // Result: ~3-4x speed boost!
+    const emailArgs = filters.extractEmails ? '-email' : '';
+
+    let command = `docker run --rm -v "${workDir}:/data" google-maps-scraper -c 35 -depth ${filters.depth || 10} -lang en -zoom 14 ${emailArgs} -input /data/${inputFile} -results /data/${outputFile}`.replace(/\s+/g, ' ').trim();
 
     console.log('Executing Docker scraper...');
     console.log('Query:', query);
     console.log('Depth:', filters.depth || 10);
+    console.log('Workers:', 35);
 
-    // Execute the scraper
+    // Execute the scraper with longer timeout
     const { stdout, stderr } = await execAsync(command, {
       cwd: scraperDir,
       maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-      timeout: 300000, // 5 minutes timeout
+      timeout: 600000, // 10 minutes timeout
     });
 
     if (stderr) {
