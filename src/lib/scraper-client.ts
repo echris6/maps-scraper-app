@@ -50,25 +50,40 @@ export async function executeScraper(config: ScraperConfig): Promise<Business[]>
     console.log('Workers:', 35);
 
     // Execute the scraper with longer timeout
-    const { stdout, stderr } = await execAsync(command, {
-      cwd: scraperDir,
-      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-      timeout: 600000, // 10 minutes timeout
-    });
+    try {
+      const { stdout, stderr } = await execAsync(command, {
+        cwd: scraperDir,
+        maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+        timeout: 600000, // 10 minutes timeout
+      });
 
-    if (stderr) {
-      console.error('Scraper stderr:', stderr);
+      if (stderr) {
+        console.error('Scraper stderr:', stderr);
+      }
+      if (stdout) {
+        console.log('Scraper output:', stdout);
+      }
+    } catch (execError: any) {
+      // Docker process may be killed (SIGPIPE) after completing work
+      // Check if results file exists before treating as error
+      console.warn('Docker process exited with error:', execError.message);
+      console.log('Checking if results were still generated...');
     }
-    if (stdout) {
-      console.log('Scraper output:', stdout);
+
+    // Read and parse CSV results (even if Docker was killed after finishing)
+    try {
+      const resultsContent = await fs.readFile(outputFilePath, 'utf-8');
+      const businesses = await parseCSV(resultsContent);
+
+      if (businesses.length === 0) {
+        throw new Error('No businesses found in results file');
+      }
+
+      console.log(`Scraped ${businesses.length} businesses successfully`);
+      return businesses;
+    } catch (readError: any) {
+      throw new Error(`Failed to read results: ${readError.message}`);
     }
-
-    // Read and parse CSV results
-    const resultsContent = await fs.readFile(outputFilePath, 'utf-8');
-    const businesses = await parseCSV(resultsContent);
-
-    console.log(`Scraped ${businesses.length} businesses`);
-    return businesses;
 
   } catch (error: any) {
     console.error('Scraper execution error:', error);
